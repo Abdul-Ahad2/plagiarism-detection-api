@@ -57,7 +57,7 @@ Lexical Analysis (student)
 ```POST /student/lexical-analysis```.
 Finds lexical overlap for a single file (phrases, n-grams).
 
-Semantic Analysis (Teacher)
+Semantic Analysis (teacher)
 ```POST /teacher/semantic-analysis```. Uploads documents and compares them with external corpus.
 
 Internal Analysis (teacher)
