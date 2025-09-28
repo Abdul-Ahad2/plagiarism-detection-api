@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+motor
+python-jose
+nltk
+rapidfuzz
+pdfminer.six
+python-docx
+pymongo
+python-multipart
+sentence-transformers
+numpy
+transformers
+torch
+accelerate

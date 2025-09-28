@@ -1,0 +1,65 @@
+# ------------------------
+# Python
+# ------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ------------------------
+# Test / Coverage
+# ------------------------
+.pytest_cache/
+.tox/
+.coverage
+coverage.xml
+htmlcov/
+
+# Ignore ONLY top-level tests folder (outside app/)
+# Remove this line if you want to keep tests in Git
+/tests/
+
+# ------------------------
+# OS Specific
+# ------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.Icon?
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ------------------------
+# IDE / Editor
+# ------------------------
+# VS Code
+.vscode/
+
+# PyCharm / IntelliJ
+.idea/
+
+# Others
+*.swp
+*.swo
+
+# ------------------------
+# Environment / Config
+# ------------------------
+.env
+.env.local
+.env.*
+config.py/
