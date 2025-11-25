@@ -1,9 +1,10 @@
 import logging
 from fastapi import FastAPI
-from app.routers.student.lexical_analysis import router as plagiarism_router
-from app.routers.teacher.semantic_analysis import router as semantic_router
-from app.routers.teacher.lexical_analysis import router as lexical_router
-from app.routers.teacher.internal_analysis import router as internal_router
+from app.routers.student.lexical_analysis import router as student_lexical_router
+from app.routers.teacher.semantic_analysis import router as teacher_semantic_router
+from app.routers.teacher.lexical_analysis import router as teacher_lexical_router
+from app.routers.teacher.internal_analysis import router as teacher_internal_router
+
 from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO)
@@ -19,7 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(plagiarism_router)
-app.include_router(semantic_router)
-app.include_router(lexical_router)
-app.include_router(internal_router)
+app.include_router(student_lexical_router)
+app.include_router(teacher_internal_router)
+app.include_router(teacher_lexical_router)
+app.include_router(teacher_semantic_router)

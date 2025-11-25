@@ -26,6 +26,8 @@ class ComparisonDetail(BaseModel):
     similarity: float  # percent (0–100)
     flagged: bool
     overlaps: List[OverlapDetail] = Field(default_factory=list)
+    contentA: str = ""
+    contentB: str = ""
 
 class InternalReportSummary(BaseModel):
     totalDocuments: int
@@ -64,6 +66,7 @@ class LexicalDocResult(BaseModel):
     flagged: bool
     wordCount: Optional[int] = None
     matches: List[LexicalMatch] = Field(default_factory=list)
+    content: Optional[str] = None 
 
 class TeacherLexicalSummary(BaseModel):
     totalDocuments: int
@@ -113,3 +116,68 @@ class TeacherSemanticReport(BaseModel):
     comparisons: List[SemanticComparison]
     summary: InternalReportSummary
     narrative: Optional[str] = None  
+    
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime
+
+class CodeMatch(BaseModel):
+    matched_code: str
+    similarity: float
+    source_type: str  # 'peer', 'github', 'stackoverflow', 'web'
+    source_title: str
+    source_url: Optional[str] = None
+    match_type: str  # 'exact', 'structural', 'token_sequence'
+    line_start: Optional[int] = None
+    line_end: Optional[int] = None
+    context: Optional[str] = None
+
+class CodeFunction(BaseModel):
+    name: str
+    start_line: int
+    end_line: int
+    code: str
+    complexity: int  # Cyclomatic complexity
+    tokens: List[str]
+    ast_hash: str
+
+class CodeDocResult(BaseModel):
+    id: int
+    name: str
+    author: Optional[str] = None
+    similarity: float
+    flagged: bool
+    lineCount: int
+    functionCount: int
+    matches: List[CodeMatch]
+    functions: List[CodeFunction]
+    content: str  # Full code content
+    language: str
+
+class CodeAnalysisSummary(BaseModel):
+    totalDocuments: int
+    flaggedDocuments: int
+    highestSimilarity: float
+    averageSimilarity: float
+    totalMatches: int
+    peerMatches: int
+    externalMatches: int
+
+class TeacherCodeBatchReport(BaseModel):
+    id: str
+    name: str
+    uploadDate: datetime
+    processingTime: str
+    documents: List[CodeDocResult]
+    summary: CodeAnalysisSummary
+    assignmentTopic: Optional[str] = None
+
+class InternalMatch(BaseModel):
+    """Match between two student submissions"""
+    student1_id: int
+    student2_id: int
+    student1_name: str
+    student2_name: str
+    similarity: float
+    match_type: str
+    matched_functions: List[str]

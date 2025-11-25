@@ -4,16 +4,15 @@ import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
-from rapidfuzz.distance import Levenshtein  # edit-distance similarity
+from rapidfuzz.distance import Levenshtein
 
 from app.config import (
     MIN_WORDS_PER_SENTENCE,
     MIN_SENTENCE_LENGTH,
-    SEQUENCE_THRESHOLD,   # use e.g. 0.75
-    EXACT_MATCH_SCORE,    # e.g. 1.0
+    SEQUENCE_THRESHOLD,
+    EXACT_MATCH_SCORE,
 )
 
-# Ensure required NLTK resources are downloaded
 nltk.download("punkt")
 nltk.download("stopwords")
 nltk.download("wordnet")
@@ -21,43 +20,27 @@ nltk.download('punkt_tab')
 
 lemmatizer = WordNetLemmatizer()
 
-# ---------- Normalization ----------
-
 def normalize_text(text: str) -> str:
     if not text:
         return ""
-    # Basic lowercasing
     text = text.lower()
-
-    # --- NEW: pre-clean artifacts that break shingles ---
-    text = text.replace("\u00ad", "")                    # soft hyphen
-    text = re.sub(r"-\s*\n\s*", "", text)                # hyphenated line breaks
+    text = text.replace("\u00ad", "")
+    text = re.sub(r"-\s*\n\s*", "", text)
     text = text.replace("\n", " ")
-    # text = text.replace("&", " and ")                    # '&' -> 'and'
-    text = re.sub(r"[^\x20-\x7E]+", " ", text)           # strip non-printables
-
-    # Smart quotes / dashes
-    text = (text.replace("’", "'").replace("‘", "'")
-                 .replace("“", '"').replace("”", '"')
+    text = re.sub(r"[^\x20-\x7E]+", " ", text)
+    text = (text.replace("'", "'").replace("'", "'")
+                 .replace(""", '"').replace(""", '"')
                  .replace("—", "-").replace("–", "-"))
-
-    # Remove residual punctuation (keep hyphen)
     text = re.sub(r"[^\w\s-]", " ", text)
-
-    # Collapse spaces *before* tokenization to avoid empty tokens
     text = re.sub(r"\s+", " ", text).strip()
-
-    # Lemmatize
     tokens = word_tokenize(text)
     lemmas = [lemmatizer.lemmatize(tok) for tok in tokens]
     normalized = " ".join(lemmas)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
 
-
-# ---------- Sentence filtering ----------
-
 def get_meaningful_sentences(text: str) -> List[str]:
+    """Extract meaningful sentences from text."""
     sentences = sent_tokenize(text or "")
     filtered = []
     for s in sentences:
@@ -66,16 +49,13 @@ def get_meaningful_sentences(text: str) -> List[str]:
             filtered.append(s.strip())
     return filtered
 
-# ---------- Keyword extraction (simple & fine) ----------
-
 def extract_keywords(text: str, max_keywords: int = 5) -> List[str]:
+    """Extract top keywords from text for search queries."""
     words = word_tokenize((text or "").lower())
     stop_words = set(stopwords.words("english"))
     filtered = [w for w in words if w.isalpha() and w not in stop_words and len(w) > 3]
     freq = nltk.FreqDist(filtered)
     return [word for word, _ in freq.most_common(max_keywords)]
-
-# ---------- Shingling & set-based overlap ----------
 
 def _word_shingles(norm_text: str, k: int = 7) -> List[str]:
     tokens = norm_text.split()
@@ -99,13 +79,7 @@ def _containment(a: Set[str], b: Set[str]) -> float:
     inter = len(a & b)
     return inter / len(a)
 
-# ---------- Winnowing (fingerprinting) ----------
-
 def _winnowing_hashes(norm_text: str, k: int = 7, w: int = 4) -> List[Tuple[int, int]]:
-    """
-    Returns fingerprints as (hash, shingle_start_idx_in_tokens).
-    Min guaranteed match length ≈ k + w - 1 words.
-    """
     tokens = norm_text.split()
     if len(tokens) < k:
         return []
@@ -119,7 +93,6 @@ def _winnowing_hashes(norm_text: str, k: int = 7, w: int = 4) -> List[Tuple[int,
     last_min_abs = -1
     for i in range(0, len(hashes) - w + 1):
         window = hashes[i:i+w]
-        # rightmost minimum
         min_hash, min_idx = None, None
         for j, (h, _) in enumerate(window):
             if (min_hash is None) or (h < min_hash) or (h == min_hash and j > (min_idx or -1)):
@@ -137,8 +110,6 @@ def _winnowing_overlap(a_fp: List[Tuple[int, int]], b_fp: List[Tuple[int, int]])
     shared = len(a_set & b_set)
     denom = min(len(a_set), len(b_set)) or 1
     return shared / denom
-
-# ---------- Exact matching (substring), Edit distance, LCS ----------
 
 def _exact_substring(norm_sentence: str, norm_external: str) -> bool:
     if not norm_sentence or not norm_external:
@@ -169,15 +140,41 @@ def _lcs_length(a: str, b: str) -> int:
         prev = curr
     return best
 
-# ---------- PUBLIC API (same names you already use) ----------
+def _extract_phrases(norm_text: str, min_words: int = 3, max_words: int = 7) -> List[str]:
+    """Extract all phrases of varying lengths for partial match detection."""
+    tokens = norm_text.split()
+    phrases = []
+    for k in range(min_words, min(max_words + 1, len(tokens) + 1)):
+        for i in range(len(tokens) - k + 1):
+            phrases.append(" ".join(tokens[i:i+k]))
+    return phrases
+
+def _phrase_containment_match(norm_sentence: str, norm_external: str) -> Optional[Tuple[str, float]]:
+    """Check if ANY phrase (3-7 words) from sentence appears in external text."""
+    phrases = _extract_phrases(norm_sentence, min_words=3, max_words=7)
+    
+    best_phrase = None
+    best_score = 0.0
+    
+    for phrase in phrases:
+        if phrase in norm_external:
+            score = len(phrase.split()) / len(norm_sentence.split())
+            if score > best_score:
+                best_score = score
+                best_phrase = phrase
+    
+    if best_phrase and best_score >= 0.4:
+        return best_phrase, round(best_score, 3)
+    
+    return None
 
 def find_exact_matches(sentence: str, external_text: str) -> Optional[float]:
     """
-    Full-sentence lexical match (with LCS safety net):
-      1) exact substring on normalized forms → EXACT_MATCH_SCORE
-      2) winnowing fingerprint overlap → score in [0,1]
-      3) edit-distance similarity → fallback
-      4) LCS (longest common substring) length fallback (chars) → lcs_len/len(norm_s)
+    Full-sentence lexical match with multiple strategies:
+      1) Exact substring match → EXACT_MATCH_SCORE (100%)
+      2) Winnowing fingerprints → robust plagiarism detection
+      3) Edit-distance (Levenshtein) → catches paraphrased content
+      4) LCS (longest common substring) → catches missed overlaps
     """
     norm_s = normalize_text(sentence)
     norm_e = normalize_text(external_text)
@@ -189,25 +186,23 @@ def find_exact_matches(sentence: str, external_text: str) -> Optional[float]:
     if _exact_substring(norm_s, norm_e):
         return EXACT_MATCH_SCORE
 
-    # 2) Winnowing overlap (robust exact-ish)
+    # 2) Winnowing overlap
     win_sim = _winnowing_overlap(
         _winnowing_hashes(norm_s, k=5, w=4),
         _winnowing_hashes(norm_e, k=5, w=4),
     )
-    if win_sim >= SEQUENCE_THRESHOLD:
+    if win_sim >= SEQUENCE_THRESHOLD * 0.9:
         return round(win_sim, 3)
 
-    # 3) Edit-distance fallback (paraphrase-lite)
+    # 3) Edit-distance fallback
     lev = _levenshtein_sim(norm_s, norm_e)
     if lev >= SEQUENCE_THRESHOLD:
         return round(lev, 3)
 
-    # 4) LCS fallback (catches long contiguous overlaps missed above)
-    #    Adjust threshold to your tolerance; 25–35 chars works well for academic text.
+    # 4) LCS fallback
     lcs_len = _lcs_length(norm_s, norm_e)
-    LCS_MIN_CHARS = 25  # <- tune: 25–35 typical
+    LCS_MIN_CHARS = 15
     if lcs_len >= LCS_MIN_CHARS:
-        # Normalize by sentence length to keep output in [0,1]
         return round(lcs_len / max(1, len(norm_s)), 3)
 
     return None
@@ -215,25 +210,84 @@ def find_exact_matches(sentence: str, external_text: str) -> Optional[float]:
 
 def find_partial_phrase_match(sentence: str, external_text: str) -> Optional[Tuple[str, float]]:
     """
-    Partial reuse via 7-word shingles:
-      - compute Jaccard and Containment
-      - if strong enough, return (representative_phrase, score)
+    Partial reuse detection via multiple strategies:
+      1) Phrase containment (3-7 word phrases)
+      2) Shingle-based Jaccard/Containment
+      3) Edit distance as fallback
     """
     norm_s = normalize_text(sentence)
     norm_e = normalize_text(external_text)
+    
+    if not norm_s or not norm_e:
+        return None
+
+    # Strategy 1: Check if any 3-7 word phrase appears verbatim
+    phrase_match = _phrase_containment_match(norm_s, norm_e)
+    if phrase_match:
+        return sentence, phrase_match[1]
+
+    # Strategy 2: 7-word shingles
     A, B = _shingle_sets(norm_s, norm_e, k=7)
-    if not A or not B:
-        return None
+    if A and B:
+        jac = _jaccard(A, B)
+        con = _containment(A, B)
+        score = max(jac, con)
+        if score >= SEQUENCE_THRESHOLD * 0.8:
+            return sentence, round(score, 3)
 
-    jac = _jaccard(A, B)
-    con = _containment(A, B)
-    score = max(jac, con)
-    if score < SEQUENCE_THRESHOLD:
-        return None
+    # Strategy 3: Smaller shingles (5-word) for more matches
+    A_small, B_small = _shingle_sets(norm_s, norm_e, k=5)
+    if A_small and B_small:
+        jac_small = _jaccard(A_small, B_small)
+        con_small = _containment(A_small, B_small)
+        score_small = max(jac_small, con_small)
+        if score_small >= SEQUENCE_THRESHOLD * 0.75:
+            return sentence, round(score_small, 3)
 
-    # Representative phrase: first shared shingle mapped to original sentence (best-effort)
-    shared = list(A & B)
-    if shared:
-        # return original sentence as the matched_text (simpler for UI)
-        return sentence, round(score, 3)
+    # Strategy 4: Edit distance as last resort
+    lev = _levenshtein_sim(norm_s, norm_e)
+    if lev >= SEQUENCE_THRESHOLD * 0.85:
+        return sentence, round(lev, 3)
+
     return None
+
+def find_partial_phrase_match_for_internal(sentence: str, external_text: str) -> Optional[Tuple[str, float]]:
+    """
+    Wrapper around find_partial_phrase_match that extracts the actual matched phrase
+    that appears in BOTH documents, not just the full sentence from the first doc.
+    """
+    result = find_partial_phrase_match(sentence, external_text)
+    if not result:
+        return None
+    
+    matched_text, score = result
+    norm_s = normalize_text(sentence)
+    norm_e = normalize_text(external_text)
+    
+    if not norm_s or not norm_e:
+        return result
+    
+    # Find the longest common substring that appears in both
+    words_s = norm_s.split()
+    words_e = norm_e.split()
+    
+    best_common = ""
+    best_len = 0
+    
+    # Try all consecutive word sequences from sentence A
+    for i in range(len(words_s)):
+        for j in range(i + 1, len(words_s) + 1):
+            phrase = ' '.join(words_s[i:j])
+            # Check if this phrase exists in document B
+            if phrase in norm_e:
+                phrase_len = len(phrase)
+                if phrase_len > best_len:
+                    best_common = phrase
+                    best_len = phrase_len
+    
+    # If we found a common phrase, return it
+    if best_common:
+        return best_common, score
+    
+    # Fallback: return original result
+    return matched_text, score

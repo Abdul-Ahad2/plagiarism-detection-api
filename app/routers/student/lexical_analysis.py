@@ -1,29 +1,28 @@
-import re
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from typing import Optional
 from datetime import datetime
-from typing import List, Optional
-
-from fastapi import APIRouter, File, UploadFile, Form, HTTPException, Depends
 from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
 from motor.motor_asyncio import AsyncIOMotorClient
-from jose import jwt, JWTError
+import os
 
-from app.schemas.plagiarism_schemas import MatchDetail
-from app.schemas.report_schemas import ReportDetail
+from app.config import MONGODB_URI,ALGORITHM, SECRET_KEY
+from app.schemas.teacher_schemas import (
+    LexicalMatch
+)
 from app.utils.file_utils import extract_text_from_file, allowed_file
 from app.utils.lexical_utils import (
-    normalize_text,
-    get_meaningful_sentences,
-    extract_keywords,
-    find_exact_matches,
-    find_partial_phrase_match,
+    get_meaningful_sentences, extract_keywords,
+    find_exact_matches, find_partial_phrase_match,
 )
-from app.config import MONGODB_URI
+from app.utils.web_utils import fetch_sources, fetch_sources_multi_query
 
-router = APIRouter()
+router = APIRouter(prefix="/student", tags=["student-lexical"])
 
-SECRET_KEY = "your_nextauth_secret"
-ALGORITHM = "HS256"
+LEXICAL_DOC_THRESHOLD = 0.85  # 85%
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+
+
 
 def verify_token(token: str = Depends(oauth2_scheme)):
     try:
@@ -34,193 +33,193 @@ def verify_token(token: str = Depends(oauth2_scheme)):
 async def get_mongo_client():
     return AsyncIOMotorClient(MONGODB_URI)
 
-@router.post("/student/lexical-analysis", response_model=ReportDetail)
-async def check_plagiarism(
-    file: Optional[UploadFile] = File(None),
-    text: Optional[str] = Form(None),
-    mongo_client: AsyncIOMotorClient = Depends(get_mongo_client),
-    token_payload: dict = Depends(verify_token),
+@router.post("/lexical-analysis")
+async def student_lexical_analysis(
+    file: UploadFile = File(...),
+    current_user=Depends(verify_token),
 ):
-    start = datetime.utcnow()
-    db = mongo_client.get_default_database()
-    reports_collection = db["reports"]
-    data_collection = db["datas"]  
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
 
-    # 1) Extract raw text
-    if file and file.filename:
-        if not allowed_file(file.filename):
-            raise HTTPException(status_code=400, detail="Invalid file type.")
-        content_bytes = await file.read()
-        raw_text = extract_text_from_file(content_bytes, file.filename)
-        title = file.filename
-    elif text and text.strip():
-        raw_text = text
-        title = "pasted_text_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    else:
-        raise HTTPException(status_code=400, detail="No file or text provided.")
+    t0 = datetime.utcnow()
+    total_matches = 0
 
-    if not raw_text.strip():
-        raise HTTPException(status_code=400, detail="No readable text found.")
+    print(f"🔍 Starting student lexical analysis for uploaded file...")
 
-    # 2) Sentence split
-    sentences = get_meaningful_sentences(raw_text)
-    if not sentences:
-        empty_doc = {
-            "user_id": token_payload.get("sub"),
-            "name": title,
-            "content": raw_text,
-            "date": datetime.utcnow(),
-            "similarity": 0.0,
-            "sources": [],
-            "word_count": len(raw_text.split()),
-            "time_spent": "00:00",
-            "flagged": False,
-            "plagiarism_data": [],
+    # Process single file
+    if not allowed_file(file.filename):
+        raise HTTPException(status_code=400, detail=f"Invalid file type: {file.filename}")
+
+    raw = await file.read()
+    text = extract_text_from_file(raw, file.filename) or ""
+    sentences = get_meaningful_sentences(text)
+
+    print(f"\n📄 Processing file: {file.filename}")
+    print(f"   ➤ Extracted {len(sentences)} sentences")
+    print(f"   ➤ Approx word count: {len(text.split())}")
+
+    # Build search query from keywords
+    sources = fetch_sources_multi_query(text, num_results=10)
+    print(f"   ➤ Found {len(sources)} online sources from diverse queries")
+
+    if not sources:
+        raise HTTPException(status_code=404, detail=f"No sources found online for {file.filename}")
+
+    matches = []
+    highest = 0.0
+    source_matches_count = {}
+
+    externals = [
+        {
+            "title": s.get("url", "Unknown"),
+            "text": s.get("content", ""),
+            "source_url": s.get("url", ""),
+            "type": "web",
         }
-        insert_result = await reports_collection.insert_one(empty_doc)
-        return ReportDetail(
-            id=str(insert_result.inserted_id),
-            name=title,
-            content=raw_text,
-            plagiarism_data=[]
-        )
+        for s in sources if s.get("content")
+    ]
 
-    # 3) Build query
-    keywords = extract_keywords(raw_text, max_keywords=5)
-    query = " ".join(keywords) if keywords else raw_text[:100]
+    for ext in externals:
+        print(f"      🌐 Source: {ext['source_url'][:60]}...")
+        source_matches_count[ext['source_url']] = 0
 
-    # 4) Fetch candidates from DB (prefer $text)
-    external_texts: List[dict] = []
-    docs = []
-    try:
-        cursor = data_collection.find(
-            {"$text": {"$search": query}},
-            {"score": {"$meta": "textScore"}, "title": 1, "text": 1, "source_url": 1, "type": 1},
-        ).sort([("score", {"$meta": "textScore"})]).limit(200)
-        docs = await cursor.to_list(length=200)
-    except Exception:
-        pass
+    # Compare each sentence against ALL sources
+    for s in sentences:
+        best_overall_score = 0.0
+        best_overall_match = None
+        best_overall_src = None
 
-    if not docs:
-        tokens = keywords or re.findall(r"\w+", query)
-        if tokens:
-            regex = "|".join(re.escape(t) for t in tokens)
-            cursor = data_collection.find(
-                {"$or": [
-                    {"title": {"$regex": regex, "$options": "i"}},
-                    {"text":  {"$regex": regex, "$options": "i"}},
-                ]},
-                {"title": 1, "text": 1, "source_url": 1, "type": 1}
-            ).limit(200)
-            docs = await cursor.to_list(length=200)
+        for ext in externals:
+            # Try exact match first
+            sim = find_exact_matches(s, ext["text"])
+            if sim is not None and sim > best_overall_score:
+                best_overall_score = sim
+                best_overall_match = s
+                best_overall_src = ext
+                continue
 
-    for doc in docs:
-        txt = (doc.get("text") or "").strip()
-        if txt:
-            external_texts.append({
-                "text": txt,
-                "title": doc.get("title", "Unknown"),
-                "source_url": doc.get("source_url", ""),
-                "type": doc.get("type", "other"),
-            })
+            # Try partial phrase match
+            pp = find_partial_phrase_match(s, ext["text"])
+            if pp:
+                phrase, score = pp
+                if score > best_overall_score:
+                    best_overall_score = score
+                    best_overall_match = phrase
+                    best_overall_src = ext
 
-    # 5) No candidates → empty report
-    if not external_texts:
-        empty_doc = {
-            "user_id": token_payload.get("sub"),
-            "name": title,
-            "content": raw_text,
-            "date": datetime.utcnow(),
-            "similarity": 0.0,
-            "sources": [],
-            "word_count": len(raw_text.split()),
-            "time_spent": "00:00",
-            "flagged": False,
-            "plagiarism_data": [],
-        }
-        insert_result = await reports_collection.insert_one(empty_doc)
-        return ReportDetail(
-            id=str(insert_result.inserted_id),
-            name=title,
-            content=raw_text,
-            plagiarism_data=[]
-        )
-
-    # 6) Matching (uses improved lexical funcs)
-    plagiarism_data_for_db: List[dict] = []
-    highest_similarity = 0.0
-    all_matched_titles = set()
-
-    for orig in sentences:
-        matched = False
-        for ext in external_texts:
-            sim = find_exact_matches(orig, ext["text"])
-            if sim is not None:
-                score = round(sim, 3)
-                plagiarism_data_for_db.append({
-                    "matched_text": orig,
-                    "similarity":   score,
-                    "source_type":  ext["type"],
-                    "source_title": ext["title"],
-                    "source_url":   ext["source_url"],
+        # Add match if found and above threshold (50%)
+        if best_overall_match and best_overall_score > 0.0:
+            pct = round(best_overall_score * 100.0, 1)
+            
+            if pct >= 50:
+                matches.append({
+                    "matched_text": best_overall_match,
+                    "similarity": pct,
+                    "source_type": best_overall_src["type"],
+                    "source_title": best_overall_src["title"],
+                    "source_url": best_overall_src["source_url"],
+                    "context": "Potential plagiarism detected",
                 })
-                matched = True
-                highest_similarity = max(highest_similarity, sim)
-                all_matched_titles.add(ext["title"])
-                break
+                source_matches_count[best_overall_src['source_url']] += 1
+                highest = max(highest, pct)
+                total_matches += 1
+                print(f"      ✅ Match ({pct}%) with {best_overall_src['source_url'][:50]}")
 
-        if not matched:
-            for ext in external_texts:
-                partial = find_partial_phrase_match(orig, ext["text"])
-                if partial:
-                    phrase, sim = partial
-                    score = round(sim, 3)
-                    plagiarism_data_for_db.append({
-                        "matched_text": phrase,
-                        "similarity":   score,
-                        "source_type":  ext["type"],
-                        "source_title": ext["title"],
-                        "source_url":   ext["source_url"],
-                    })
-                    highest_similarity = max(highest_similarity, sim)
-                    all_matched_titles.add(ext["title"])
-                    break
-
-    # 7) Time & save
-    elapsed = datetime.utcnow() - start
-    total_sec = int(elapsed.total_seconds())
-    mins, secs = divmod(total_sec, 60)
-    hours, mins = divmod(mins, 60)
-    time_spent = f"{hours:d}:{mins:02d}:{secs:02d}" if hours else f"{mins:02d}:{secs:02d}"
-
-    highest_pct = round(highest_similarity * 100, 1)
-    flagged = highest_pct > 70
-
-    report_doc = {
-        "user_id": token_payload.get("sub"),
-        "name": title,
-        "date": datetime.utcnow(),
-        "similarity": highest_pct,
-        "sources": list(all_matched_titles),
-        "word_count": len(raw_text.split()),
-        "time_spent": time_spent,
-        "flagged": flagged,
-        "plagiarism_data": [
-            {
-                "matched_text": e["matched_text"],
-                "similarity":   e["similarity"],
-                "source_type":  e["source_type"],
-                "source_title": e["source_title"],
-                "source_url":   e["source_url"],
-            }
-            for e in plagiarism_data_for_db
-        ],
-    }
-    print(report_doc)
-    insert_res = await reports_collection.insert_one(report_doc)
-    return ReportDetail(
-        id=str(insert_res.inserted_id),
-        name=title,
-        content=raw_text,
-        plagiarism_data=plagiarism_data_for_db
+    # Better flagging logic considering multiple sources
+    num_sources_with_matches = sum(1 for c in source_matches_count.values() if c > 0)
+    avg_match_score = (sum(m["similarity"] for m in matches) / len(matches)) if matches else 0.0
+    
+    # Flag if any of these conditions are met:
+    # 1. Single source with high similarity (>85%)
+    # 2. Content plagiarized from 2+ different sources
+    # 3. 3+ matches with average >70%
+    flagged = (
+        highest >= 85 or
+        num_sources_with_matches >= 2 or
+        (len(matches) >= 3 and avg_match_score >= 70)
     )
+    
+    print(f"   ➤ Highest similarity: {highest:.1f}%")
+    print(f"   ➤ Total matches: {len(matches)}")
+    print(f"   ➤ Sources with matches: {num_sources_with_matches}")
+    print(f"   ➤ Average match score: {avg_match_score:.1f}%")
+    print(f"   ➤ Flagged: {flagged}")
+
+    elapsed = (datetime.utcnow() - t0).total_seconds()
+    mm = int(elapsed // 60)
+    ss = int(elapsed % 60)
+    processing_time = f"{mm}m {ss:02d}s"
+
+    print("\n✅ Analysis completed!")
+    print(f"   ➤ Flagged: {flagged}")
+    print(f"   ➤ Highest Similarity: {highest}%")
+    print(f"   ➤ Average Similarity: {avg_match_score:.1f}%")
+    print(f"   ➤ Processing Time: {processing_time}")
+
+    # Extract unique sources
+    all_sources = list(set(m["source_url"] for m in matches))
+
+    # Build response
+    result = {
+        "id": None,  # Will be set after MongoDB insert
+        "name": file.filename,
+        "content": text,
+        "matches": matches,
+        "similarity": round(highest, 1),
+        "flagged": flagged,
+        "wordCount": len(text.split()),
+        "processingTime": processing_time,
+        "totalMatches": total_matches,
+        "averageSimilarity": round(avg_match_score, 1),
+        "sources": all_sources,
+        "uploadDate": datetime.utcnow().isoformat(),
+    }
+
+    # Save to MongoDB
+    try:
+        mongo_client = await get_mongo_client()
+        db = mongo_client.sluethink
+        reports_collection = db.reports
+        
+        # Prepare document for MongoDB
+        report_doc = {
+            "name": file.filename,
+            "analysisType": "lexical",
+            "submittedBy": current_user.get("username", "System"),
+            "uploadDate": datetime.utcnow().strftime("%Y-%m-%d"),
+            "similarity": highest,
+            "status": "completed",
+            "flagged": flagged,
+            "fileCount": 1,
+            "processingTime": processing_time,
+            "avgSimilarity": avg_match_score,
+            "sources": all_sources,
+            "createdAt": datetime.utcnow(),
+            "userId": current_user.get("sub") or current_user.get("user_id"),
+            "content": text,
+            "wordCount": len(text.split()),
+            "matches": matches,
+            "totalMatches": total_matches,
+        }
+        
+        # Insert into MongoDB
+        insert_result = await reports_collection.insert_one(report_doc)
+        print(f"\n💾 Report saved to MongoDB with ID: {insert_result.inserted_id}")
+        
+        # Update the result with the MongoDB ID
+        result["id"] = str(insert_result.inserted_id)
+        
+        mongo_client.close()
+        
+    except Exception as e:
+        print(f"\n❌ Error saving to MongoDB: {str(e)}")
+        # Don't fail the request if MongoDB save fails
+        result["id"] = "temp_id"
+
+    print(f"\n🧾 Returning report:\n"
+          f"  Flagged: {flagged}\n"
+          f"  Avg Similarity: {avg_match_score:.1f}%\n"
+          f"  Highest Similarity: {highest}%\n"
+          f"  Total Matches: {total_matches}")
+
+    return result
