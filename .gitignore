@@ -63,3 +63,4 @@ Desktop.ini
 .env.local
 .env.*
 config.py
+scraper.log

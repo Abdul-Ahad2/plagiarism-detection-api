@@ -8,24 +8,29 @@ def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def extract_text_from_file(content_bytes: bytes, filename: str) -> str:
+def extract_text_from_file(content_bytes: bytes, filename: str, max_words: int = 500) -> str:
     ext = filename.rsplit(".", 1)[1].lower()
+    text = ""
     try:
         if ext == "txt":
-            return content_bytes.decode("utf-8", errors="ignore")
+            text = content_bytes.decode("utf-8", errors="ignore")
         elif ext == "pdf":
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                 tmp.write(content_bytes)
                 tmp.flush()
                 text = extract_pdf_text(tmp.name)
-            return text or ""
         elif ext == "docx":
             with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
                 tmp.write(content_bytes)
                 tmp.flush()
                 doc = DocxDocument(tmp.name)
                 text = "\n".join([p.text for p in doc.paragraphs])
-            return text or ""
     except Exception:
-        return ""
-    return ""
+        text = ""
+
+    # Word count check
+    word_count = len(text.split())
+    if word_count > max_words:
+        raise ValueError(f"File exceeds {max_words} words (found {word_count}).")
+
+    return text

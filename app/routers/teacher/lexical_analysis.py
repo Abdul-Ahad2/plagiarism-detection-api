@@ -54,7 +54,11 @@ async def teacher_lexical_analysis(
             raise HTTPException(status_code=400, detail=f"Invalid file type: {f.filename}")
 
         raw = await f.read()
-        text = extract_text_from_file(raw, f.filename) or ""
+        try:
+            text = extract_text_from_file(raw, f.filename) or ""
+        except ValueError as ve:
+        # Catch over-word files
+            raise HTTPException(status_code=400, detail=str(ve))
         sentences = get_meaningful_sentences(text)
 
         print(f"\n📄 Processing file {idx}: {f.filename}")

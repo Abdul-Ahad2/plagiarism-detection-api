@@ -14,6 +14,8 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 import re
 import signal
 from contextlib import contextmanager
+from ..logger import logger
+logger.info("Scraper started")
 
 # Optional fallback
 try:
@@ -28,7 +30,7 @@ REQUEST_TIMEOUT = 5  # Reduced from 6 - fail faster
 PER_URL_TIMEOUT = 8  # Reduced from 10
 POLITENESS_DELAY = 0.1  # Reduced from 0.25
 GOOGLE_NUM_DEFAULT = 10
-MIN_TEXT_LENGTH = 120
+MIN_TEXT_LENGTH = 700
 GOOGLE_API_TIMEOUT = 6
 BRAVE_API_KEY = "BSAE_jMY2tpTa_jYwCkcaiddxmzLs7m"
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
@@ -40,7 +42,6 @@ BLACKLIST_DOMAINS = {
     'jmlr.org',
     'researchgate.net',
     'arxiv.org',
-    'sciencedirect.com',
     'springer.com',
     'nature.com',
     'nips.cc',
@@ -149,87 +150,147 @@ def scrape_with_cloudscraper(url: str, timeout: int = 8):
 
 # ---- IMPROVED: Playwright with hard timeout ----
 def scrape_with_playwright(url: str, timeout: int = 8):
-    """Scrape JS-heavy pages with HARD timeout enforcement."""
+    """Scrape JS-heavy pages with aggressive waiting and content extraction."""
     try:
+        logger.debug(f"Playwright: GET {url}")
         with sync_playwright() as p:
-            # Use context timeout to enforce hard limit
-            browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+            browser = p.chromium.launch(
+                headless=True, 
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-gpu"
+                ]
+            )
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             )
-            context.set_default_timeout(timeout * 1000)  # Hard timeout on ALL operations
+            context.set_default_timeout(timeout * 1000)
             page = context.new_page()
             
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)  # Faster load strategy
-                page.wait_for_timeout(1000)  # Only wait 1 sec instead of 2
+                # Navigate with longer timeout for JS-heavy sites
+                page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+                
+                # Wait for common content containers to load
+                try:
+                    page.wait_for_selector("article, [role='article'], .post-content, .blog-content, main", timeout=3000)
+                except:
+                    pass  # Selector may not exist, continue anyway
+                
+                # Extended wait for dynamic content
+                page.wait_for_timeout(3000)  # 3 seconds for rendering
+                
+                # Scroll down to load lazy-loaded images/content
+                page.evaluate("""
+                    async () => {
+                        await new Promise((resolve) => {
+                            let totalHeight = 0;
+                            const distance = 100;
+                            const timer = setInterval(() => {
+                                window.scrollBy(0, distance);
+                                totalHeight += distance;
+                                if (totalHeight >= document.body.scrollHeight) {
+                                    clearInterval(timer);
+                                    resolve();
+                                }
+                            }, 100);
+                        });
+                    }
+                """)
+                
+                # Wait after scrolling
+                page.wait_for_timeout(1500)
+                
+                # Scroll back to top
+                page.evaluate("window.scrollTo(0, 0)")
+                page.wait_for_timeout(500)
+                
                 html = page.content()
             finally:
                 context.close()
                 browser.close()
             
             soup = BeautifulSoup(html, "html.parser")
-            text = _clean_soup(soup, prefer_main=True, max_chars=20000)
+            text = _clean_soup(soup, prefer_main=True, max_chars=25000)
+            
             if text and len(text) > MIN_TEXT_LENGTH:
                 logger.info(f"   ✅ Scraped {len(text)} chars (Playwright) for {url}")
                 return text
-            return ""
+            
+            # If we got very little content, try a less aggressive cleanup
+            logger.debug(f"Initial extraction got {len(text)} chars, trying aggressive extraction")
+            text_aggressive = _clean_soup(soup, prefer_main=False, max_chars=25000)
+            if text_aggressive and len(text_aggressive) > MIN_TEXT_LENGTH and len(text_aggressive) > len(text):
+                logger.info(f"   ✅ Scraped {len(text_aggressive)} chars (Playwright aggressive) for {url}")
+                return text_aggressive
+            
+            logger.debug(f"Playwright extraction minimal for {url}: {len(text)} chars")
+            return text if text else ""
+            
     except (PlaywrightTimeoutError, Exception) as e:
         logger.debug(f"Playwright error for {url}: {e}")
         return ""
 
 # ---- IMPROVED: Smart fallback strategy ----
 def scrape_page(url: str, timeout: int = 5):
-    """Try fast methods first, skip known slow sites."""
+    """Scrape pages in order: requests → cloudscraper → Playwright."""
     try:
         domain = urlparse(url).netloc.lower()
-        
+
         # Skip blacklisted domains entirely
         if any(bd in domain for bd in BLACKLIST_DOMAINS):
             logger.info(f"Skipping blacklisted domain: {domain}")
             return ""
-        
-        # Determine if URL likely has JS (simple heuristic)
-        js_heavy_domains = ['medium.com', 'react.dev', 'angular.io', 'app.', 'dashboard.']
-        needs_js = any(d in domain for d in js_heavy_domains)
-        
-        if needs_js:
-            # Skip requests, go straight to Playwright
-            res = scrape_with_playwright(url, timeout=timeout)
-            if res:
-                return res
-            # Then try cloudscraper as fallback
-            return scrape_with_cloudscraper(url, timeout=timeout)
-        else:
-            # Normal site: try requests first (fastest)
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-            }
+
+        # --- 1️⃣ Requests (fastest) ---
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+        try:
+            logger.debug(f"requests: GET {url}")
+            r = _SESSION.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            text = _clean_soup(soup, prefer_main=True, max_chars=20000)
+            if text and len(text) > MIN_TEXT_LENGTH:
+                logger.info(f"   ✅ Scraped {len(text)} chars (requests) for {url}")
+                return text
+        except Exception as e:
+            logger.debug(f"requests failed for {url}: {e}")
+
+        # --- 2️⃣ Cloudscraper (medium) ---
+        if CLOUDSCRAPER_AVAILABLE:
             try:
-                logger.debug(f"requests: GET {url}")
-                r = _SESSION.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                logger.debug(f"cloudscraper: GET {url}")
+                scraper = cloudscraper.create_scraper()
+                r = scraper.get(url, timeout=timeout)
                 r.raise_for_status()
                 soup = BeautifulSoup(r.text, "html.parser")
                 text = _clean_soup(soup, prefer_main=True, max_chars=20000)
                 if text and len(text) > MIN_TEXT_LENGTH:
-                    logger.info(f"   ✅ Scraped {len(text)} chars (requests) for {url}")
+                    logger.info(f"   ✅ Scraped {len(text)} chars (cloudscraper) for {url}")
                     return text
             except Exception as e:
-                logger.debug(f"requests failed for {url}: {e}")
-            
-            # Fallback chain only if requests fails
-            res = scrape_with_cloudscraper(url, timeout=timeout)
-            if res:
+                logger.debug(f"cloudscraper failed for {url}: {e}")
+
+        # --- 3️⃣ Playwright (heaviest) ---
+        try:
+            logger.debug(f"Playwright: GET {url}")
+            res = scrape_with_playwright(url, timeout=12)  # Hard timeout for all URLs
+            if res and len(res) > MIN_TEXT_LENGTH:
                 return res
-            res = scrape_with_playwright(url, timeout=timeout)
-            if res:
-                return res
+        except Exception as e:
+            logger.debug(f"Playwright failed for {url}: {e}")
+
     except Exception as e:
         logger.debug(f"All scrapers failed for {url}: {e}")
-    
+
     return ""
+
 
 # ---- IMPROVED: Parallel multi-query fetch ----
 def fetch_sources(query: str, num_results: int = 10):
@@ -262,6 +323,7 @@ def fetch_sources(query: str, num_results: int = 10):
         except Exception as e:
             logger.debug(f"Exception in _scrape_task for {u}: {e}")
             return {"url": u, "content": "", "method": "error", "len": 0, "hash": ""}
+
 
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -330,7 +392,7 @@ def fetch_sources_multi_query(text: str, num_results: int = 10) -> List[Dict[str
     DOC_EXTENSIONS = [".pdf", ".doc", ".docx", ".odf", ".xls", ".xlsx", ".ppt", ".pptx"]
 
     def _process_url(u: str, items: List) -> Optional[Dict]:
-        """Process single URL with timeout."""
+        """Process single URL with better retry logic."""
         if u in all_sources:
             return None
         if any(ext in u.lower() for ext in DOC_EXTENSIONS):
@@ -340,16 +402,25 @@ def fetch_sources_multi_query(text: str, num_results: int = 10) -> List[Dict[str
         logger.info(f"Scraping URL: {u}")
         
         try:
+            # Try scraping the page
             text_content = scrape_page(u, timeout=REQUEST_TIMEOUT)
-            if text_content:
+            if text_content and len(text_content) > MIN_TEXT_LENGTH:
+                logger.info(f"   ✅ Scraped {len(text_content)} chars for {u}")
                 return {"url": u, "content": text_content, "source_url": u}
-            else:
-                snippet = next((it.get("snippet", "") for it in items if it.get("link") == u), "")
-                if snippet:
-                    return {"url": u, "content": snippet, "source_url": u}
+            
+            # If scraping failed, try snippet as fallback
+            snippet = next((it.get("snippet", "") for it in items if it.get("link") == u), "")
+            if snippet and len(snippet) > 50:
+                logger.info(f"   ⚠️ Using snippet ({len(snippet)} chars) for {u}")
+                return {"url": u, "content": snippet, "source_url": u}
+            
+            # If no content at all, log and skip
+            logger.warning(f"   ❌ No content extracted for {u}")
+            return None
+            
         except Exception as e:
             logger.debug(f"Error scraping {u}: {e}")
-        return None
+            return None
 
     # Process queries in parallel
     with ThreadPoolExecutor(max_workers=3) as query_ex:
@@ -376,23 +447,21 @@ def fetch_sources_multi_query(text: str, num_results: int = 10) -> List[Dict[str
                             logger.warning(f"Timeout on URL")
                         except Exception as e:
                             logger.debug(f"Error: {e}")
-                        time.sleep(0.05)  # Reduced from 0.12
+                        time.sleep(0.05)
                 
-                time.sleep(0.15)  # Reduced from 0.3
+                time.sleep(0.15)
                 return list(all_sources.values())
             
             query_futures[query_ex.submit(_fetch_query_urls, q, qi)] = qi
 
-        # Collect results (non-blocking) - short timeout to prevent hanging
         try:
-            for fut in as_completed(query_futures, timeout=60):  # Max 60 sec per query batch
+            for fut in as_completed(query_futures):
                 try:
                     fut.result()
                 except Exception as e:
                     logger.warning(f"Query processing error: {e}")
         except TimeoutError:
             logger.warning("Multi-query fetch timeout - returning partial results")
-            # Cancel remaining futures
             for fut in query_futures:
                 fut.cancel()
 
