@@ -67,6 +67,7 @@ class LexicalDocResult(BaseModel):
     wordCount: Optional[int] = None
     matches: List[LexicalMatch] = Field(default_factory=list)
     content: Optional[str] = None 
+    ai_similarity: float = 0.0
 
 class TeacherLexicalSummary(BaseModel):
     totalDocuments: int
@@ -74,6 +75,7 @@ class TeacherLexicalSummary(BaseModel):
     highestSimilarity: float
     averageSimilarity: Optional[float] = None
     totalMatches: int
+    averageAiSimilarity: float = 0.0
 
 class TeacherLexicalBatchReport(BaseModel):
     id: str

@@ -2,7 +2,7 @@ from typing import Dict, List, Optional
 import requests
 from bs4 import BeautifulSoup
 import time
-from app.config import API_KEY, SEARCH_ENGINE_ID
+from app.config import API_KEYS, SEARCH_ENGINE_IDS
 import logging
 import hashlib
 from functools import lru_cache
@@ -12,8 +12,9 @@ from urllib3.util.retry import Retry
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import re
-import signal
-from contextlib import contextmanager
+import threading
+
+
 from ..logger import logger
 logger.info("Scraper started")
 
@@ -34,6 +35,21 @@ MIN_TEXT_LENGTH = 700
 GOOGLE_API_TIMEOUT = 6
 BRAVE_API_KEY = "BSAE_jMY2tpTa_jYwCkcaiddxmzLs7m"
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+
+_api_key_index = 0
+_api_key_lock = threading.Lock()
+
+def _get_next_api_credentials():
+    """Get next API key and search engine ID in round-robin fashion"""
+    global _api_key_index
+    with _api_key_lock:
+        key = API_KEYS[_api_key_index]
+        engine_id = SEARCH_ENGINE_IDS[_api_key_index]
+        _api_key_index = (_api_key_index + 1) % len(API_KEYS)
+    return key, engine_id
+
+# ✅ HARD TIMEOUT: 3 minutes (180 seconds) for ALL scraping
+MULTI_QUERY_TIMEOUT = 180
 
 # Blacklist slow/unscrapeable domains
 BLACKLIST_DOMAINS = {
@@ -74,6 +90,27 @@ def _make_session() -> requests.Session:
 
 _SESSION = _make_session()
 
+# ---- Global timeout tracking ----
+_scraping_start_time = None
+_scraping_deadline = None
+
+def _set_scraping_deadline():
+    """Set the scraping deadline to 3 minutes from now"""
+    global _scraping_start_time, _scraping_deadline
+    _scraping_start_time = time.time()
+    _scraping_deadline = _scraping_start_time + MULTI_QUERY_TIMEOUT
+
+def _time_remaining() -> float:
+    """Get remaining time in seconds"""
+    if _scraping_deadline is None:
+        return MULTI_QUERY_TIMEOUT
+    remaining = _scraping_deadline - time.time()
+    return max(0, remaining)
+
+def _is_timeout_exceeded() -> bool:
+    """Check if timeout has been exceeded"""
+    return _time_remaining() <= 0
+
 # ---- Helpers ----
 def _normalize_whitespace(s: str) -> str:
     return " ".join(s.split())
@@ -105,12 +142,14 @@ def _clean_soup(soup: BeautifulSoup, prefer_main: bool = True, max_chars: Option
 # ---- Google Search ----
 @lru_cache(maxsize=256)
 def google_search(query: str, num_results: int = 10):
-    if not API_KEY or not SEARCH_ENGINE_ID:
+    api_key, search_engine_id = _get_next_api_credentials()
+    
+    if not api_key or not search_engine_id:
         logger.warning("Missing API_KEY or SEARCH_ENGINE_ID in config.py")
         return []
 
     url = "https://www.googleapis.com/customsearch/v1"
-    params = {"key": API_KEY, "cx": SEARCH_ENGINE_ID, "q": query, "num": num_results}
+    params = {"key": api_key, "cx": search_engine_id, "q": query, "num": num_results}
     try:
         r = _SESSION.get(url, params=params, timeout=GOOGLE_API_TIMEOUT)
         r.raise_for_status()
@@ -139,7 +178,7 @@ def scrape_with_cloudscraper(url: str, timeout: int = 8):
         r = scraper.get(url, timeout=timeout)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        text = _clean_soup(soup, prefer_main=True, max_chars=20000)  # Reduced from 25k
+        text = _clean_soup(soup, prefer_main=True, max_chars=20000)
         if text and len(text) > MIN_TEXT_LENGTH:
             logger.info(f"   ✅ Scraped {len(text)} chars (cloudscraper) for {url}")
             return text
@@ -236,6 +275,11 @@ def scrape_with_playwright(url: str, timeout: int = 8):
 # ---- IMPROVED: Smart fallback strategy ----
 def scrape_page(url: str, timeout: int = 5):
     """Scrape pages in order: requests → cloudscraper → Playwright."""
+    # ✅ HARD CHECK: Exit immediately if timeout exceeded
+    if _is_timeout_exceeded():
+        logger.warning(f"Scraping timeout exceeded, skipping {url}")
+        return ""
+    
     try:
         domain = urlparse(url).netloc.lower()
 
@@ -262,6 +306,11 @@ def scrape_page(url: str, timeout: int = 5):
         except Exception as e:
             logger.debug(f"requests failed for {url}: {e}")
 
+        # ✅ HARD CHECK: Exit if timeout exceeded between attempts
+        if _is_timeout_exceeded():
+            logger.warning(f"Scraping timeout exceeded, stopping fallback methods for {url}")
+            return ""
+
         # --- 2️⃣ Cloudscraper (medium) ---
         if CLOUDSCRAPER_AVAILABLE:
             try:
@@ -277,10 +326,15 @@ def scrape_page(url: str, timeout: int = 5):
             except Exception as e:
                 logger.debug(f"cloudscraper failed for {url}: {e}")
 
+        # ✅ HARD CHECK: Exit if timeout exceeded before Playwright
+        if _is_timeout_exceeded():
+            logger.warning(f"Scraping timeout exceeded, skipping Playwright for {url}")
+            return ""
+
         # --- 3️⃣ Playwright (heaviest) ---
         try:
             logger.debug(f"Playwright: GET {url}")
-            res = scrape_with_playwright(url, timeout=12)  # Hard timeout for all URLs
+            res = scrape_with_playwright(url, timeout=12)
             if res and len(res) > MIN_TEXT_LENGTH:
                 return res
         except Exception as e:
@@ -291,9 +345,9 @@ def scrape_page(url: str, timeout: int = 5):
 
     return ""
 
-
-# ---- IMPROVED: Parallel multi-query fetch ----
+# ---- IMPROVED: Parallel fetch with HARD OVERALL TIMEOUT ----
 def fetch_sources(query: str, num_results: int = 10):
+    """Fetch sources for a single query"""
     logger.info(f"Fetching sources for query: '{query[:60]}'")
     items = google_search(query, num_results=num_results)
     if not items:
@@ -323,7 +377,6 @@ def fetch_sources(query: str, num_results: int = 10):
         except Exception as e:
             logger.debug(f"Exception in _scrape_task for {u}: {e}")
             return {"url": u, "content": "", "method": "error", "len": 0, "hash": ""}
-
 
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -371,28 +424,26 @@ def fetch_sources(query: str, num_results: int = 10):
     logger.info(f"Fetched {len(deduped)} sources for query")
     return deduped
 
-# ---- IMPROVED: Multi-query fetch - parallel processing ----
-def fetch_sources_multi_query(text: str, num_results: int = 10) -> List[Dict[str, str]]:
-    from app.utils.lexical_utils import get_meaningful_sentences
-
-    logger.info("Building sentence-pair-based queries for multi-query fetch")
-    sentences = get_meaningful_sentences(text)
-    if not sentences or len(sentences) < 2:
-        logger.warning("Not enough sentences; falling back to single query")
-        return fetch_sources(text, num_results=num_results)
-
-    queries = [
-        " ".join(sentences[:2]),
-        " ".join(sentences[len(sentences)//2 - 1 : len(sentences)//2 + 1]),
-        " ".join(sentences[-2:])
-    ]
-    logger.info(f"Built {len(queries)} queries from document")
-
+# ---- NEW: Multi-query fetch - accepts pre-generated queries ----
+def fetch_sources_multi_query(query: str, num_results: int = 10) -> List[Dict[str, str]]:
+    """
+    Accept a single pre-generated query and fetch sources.
+    NO internal query generation - just scrape this query.
+    """
+    _set_scraping_deadline()
+    
+    logger.info(f"Processing single query with overall 3-minute timeout")
+    
     all_sources: Dict[str, Dict] = {}
     DOC_EXTENSIONS = [".pdf", ".doc", ".docx", ".odf", ".xls", ".xlsx", ".ppt", ".pptx"]
+    lock = threading.Lock()
 
     def _process_url(u: str, items: List) -> Optional[Dict]:
-        """Process single URL with better retry logic."""
+        """Process single URL with timeout check"""
+        # ✅ HARD CHECK: Exit immediately if timeout exceeded
+        if _is_timeout_exceeded():
+            return None
+        
         if u in all_sources:
             return None
         if any(ext in u.lower() for ext in DOC_EXTENSIONS):
@@ -414,7 +465,6 @@ def fetch_sources_multi_query(text: str, num_results: int = 10) -> List[Dict[str
                 logger.info(f"   ⚠️ Using snippet ({len(snippet)} chars) for {u}")
                 return {"url": u, "content": snippet, "source_url": u}
             
-            # If no content at all, log and skip
             logger.warning(f"   ❌ No content extracted for {u}")
             return None
             
@@ -422,51 +472,44 @@ def fetch_sources_multi_query(text: str, num_results: int = 10) -> List[Dict[str
             logger.debug(f"Error scraping {u}: {e}")
             return None
 
-    # Process queries in parallel
-    with ThreadPoolExecutor(max_workers=3) as query_ex:
-        query_futures = {}
-        for qi, q in enumerate(queries):
-            def _fetch_query_urls(query_text: str, qi_val: int):
-                logger.info(f"Query {qi_val}/{len(queries)}: '{query_text[:60]}'")
-                items = google_search(query_text, num_results=num_results)
-                if not items:
-                    return []
-                
-                urls = [it["link"] for it in items if it.get("link")]
-                
-                # Process URLs for this query in parallel
-                with ThreadPoolExecutor(max_workers=4) as url_ex:
-                    url_futures = {url_ex.submit(_process_url, u, items): u for u in urls}
-                    for fut in as_completed(url_futures):
-                        try:
-                            result = fut.result(timeout=PER_URL_TIMEOUT)
-                            if result:
-                                all_sources[result['url']] = result
-                                logger.info(f"   ✅ Added: {result['url'][:50]}")
-                        except FuturesTimeoutError:
-                            logger.warning(f"Timeout on URL")
-                        except Exception as e:
-                            logger.debug(f"Error: {e}")
-                        time.sleep(0.05)
-                
-                time.sleep(0.15)
-                return list(all_sources.values())
+    # ✅ HARD CHECK: Exit if timeout exceeded
+    if _is_timeout_exceeded():
+        logger.warning(f"Timeout exceeded, skipping query")
+        return []
+    
+    logger.info(f"Query: '{query[:60]}'")
+    items = google_search(query, num_results=num_results)
+    if not items:
+        return []
+    
+    urls = [it["link"] for it in items if it.get("link")]
+    
+    # Process URLs for this query in parallel
+    with ThreadPoolExecutor(max_workers=4) as url_ex:
+        url_futures = {url_ex.submit(_process_url, u, items): u for u in urls}
+        for fut in as_completed(url_futures):
+            # ✅ HARD CHECK: Exit if timeout exceeded
+            if _is_timeout_exceeded():
+                logger.warning(f"Timeout exceeded, stopping URL processing")
+                for f in url_futures:
+                    f.cancel()
+                break
             
-            query_futures[query_ex.submit(_fetch_query_urls, q, qi)] = qi
-
-        try:
-            for fut in as_completed(query_futures):
-                try:
-                    fut.result()
-                except Exception as e:
-                    logger.warning(f"Query processing error: {e}")
-        except TimeoutError:
-            logger.warning("Multi-query fetch timeout - returning partial results")
-            for fut in query_futures:
-                fut.cancel()
+            try:
+                result = fut.result(timeout=PER_URL_TIMEOUT)
+                if result:
+                    with lock:
+                        all_sources[result['url']] = result
+                    logger.info(f"   ✅ Added: {result['url'][:50]}")
+            except FuturesTimeoutError:
+                logger.warning(f"Timeout on URL")
+            except Exception as e:
+                logger.debug(f"Error: {e}")
+            time.sleep(0.05)
 
     res = list(all_sources.values())
-    logger.info(f"Total unique sources from multi-query: {len(res)}")
+    elapsed = time.time() - _scraping_start_time if _scraping_start_time else 0
+    logger.info(f"Sources for this query: {len(res)} (elapsed: {elapsed:.1f}s)")
     return res
 
 

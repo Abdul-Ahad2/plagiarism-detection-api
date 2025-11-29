@@ -85,16 +85,17 @@ def extract_key_sentences(text: str, num_sentences: int = 5) -> List[str]:
     
     return result
 
-def generate_three_queries(text: str, max_words: int = 3000) -> List[str]:
+def generate_five_queries(text: str, max_words: int = 3000) -> List[str]:
     """
-    Generate 3 high-quality semantic search queries from document.
-    Uses longer, more meaningful paragraphs for better web search results.
+    Generate 5 high-quality semantic search queries from document.
     
-    Query 1: Main Topic Paragraph (beginning)
-    Query 2: Supporting Evidence Paragraph (middle)
-    Query 3: Conclusion/Related Concepts Paragraph (end)
+    Query 1: Beginning (main topic)
+    Query 2: Early Middle
+    Query 3: Center (supporting evidence)
+    Query 4: Late Middle
+    Query 5: End (conclusions)
     """
-    logger.info("   🔍 Generating semantic queries from content...")
+    logger.info("   🔍 Generating 5 semantic queries from content...")
     
     words = text.split()
     if len(words) > max_words:
@@ -106,36 +107,52 @@ def generate_three_queries(text: str, max_words: int = 3000) -> List[str]:
         logger.warning("   ⚠️  Very short document, using basic queries")
         return [
             ' '.join(words[:30]),
-            ' '.join(words[max(0, len(words)//3):max(0, len(words)//3)+30]),
-            ' '.join(words[max(0, 2*len(words)//3):max(0, 2*len(words)//3)+30])
+            ' '.join(words[max(0, len(words)//5):max(0, len(words)//5)+30]),
+            ' '.join(words[max(0, 2*len(words)//5):max(0, 2*len(words)//5)+30]),
+            ' '.join(words[max(0, 3*len(words)//5):max(0, 3*len(words)//5)+30]),
+            ' '.join(words[max(0, 4*len(words)//5):max(0, 4*len(words)//5)+30])
         ]
     
     queries = []
+    total_sentences = len(sentences)
     
-    # ✅ Query 1: BEGINNING PARAGRAPH - First 3-4 sentences (main topic)
-    # This sets up the main subject matter
-    beginning_end = min(4, len(sentences))
+    # ✅ Query 1: BEGINNING - First 3-4 sentences
+    beginning_end = min(4, total_sentences // 5)
     query1_sents = sentences[:beginning_end]
     query1 = ' '.join(query1_sents)
     queries.append(query1)
-    logger.debug(f"   Query 1 length: {len(query1.split())} words")
+    logger.debug(f"   Query 1 (Beginning) length: {len(query1.split())} words")
     
-    # ✅ Query 2: MIDDLE PARAGRAPH - Supporting evidence (3-4 sentences from middle)
-    # This has specific details and examples
-    mid_start = max(beginning_end, len(sentences) // 3)
-    mid_end = min(mid_start + 4, len(sentences))
-    query2_sents = sentences[mid_start:mid_end]
+    # ✅ Query 2: EARLY MIDDLE - First third
+    early_start = beginning_end
+    early_end = min(early_start + 4, total_sentences // 3)
+    query2_sents = sentences[early_start:early_end]
     query2 = ' '.join(query2_sents)
     queries.append(query2)
-    logger.debug(f"   Query 2 length: {len(query2.split())} words")
+    logger.debug(f"   Query 2 (Early Middle) length: {len(query2.split())} words")
     
-    # ✅ Query 3: END PARAGRAPH - Conclusions and related concepts (last 3-4 sentences)
-    # This captures implications and final thoughts
-    end_start = max(mid_end, len(sentences) - 4)
-    query3_sents = sentences[end_start:]
+    # ✅ Query 3: CENTER - Middle section (3-4 sentences)
+    mid_start = max(early_end, total_sentences // 3)
+    mid_end = min(mid_start + 4, 2 * total_sentences // 3)
+    query3_sents = sentences[mid_start:mid_end]
     query3 = ' '.join(query3_sents)
     queries.append(query3)
-    logger.debug(f"   Query 3 length: {len(query3.split())} words")
+    logger.debug(f"   Query 3 (Center) length: {len(query3.split())} words")
+    
+    # ✅ Query 4: LATE MIDDLE - Second two-thirds
+    late_start = mid_end
+    late_end = min(late_start + 4, 2 * total_sentences // 3 + (total_sentences // 3))
+    query4_sents = sentences[late_start:late_end]
+    query4 = ' '.join(query4_sents)
+    queries.append(query4)
+    logger.debug(f"   Query 4 (Late Middle) length: {len(query4.split())} words")
+    
+    # ✅ Query 5: END - Last 3-4 sentences
+    end_start = max(late_end, total_sentences - 4)
+    query5_sents = sentences[end_start:]
+    query5 = ' '.join(query5_sents)
+    queries.append(query5)
+    logger.debug(f"   Query 5 (End) length: {len(query5.split())} words")
     
     # ✅ Clean and validate queries
     final_queries = []
