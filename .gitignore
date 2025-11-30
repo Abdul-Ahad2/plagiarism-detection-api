@@ -62,5 +62,4 @@ Desktop.ini
 .env
 .env.local
 .env.*
-config.py
 scraper.log

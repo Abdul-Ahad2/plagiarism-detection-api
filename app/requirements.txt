@@ -13,3 +13,13 @@ numpy
 transformers
 torch
 accelerate
+pydantic
+requests
+beautifulsoup4
+lxml
+cloudscraper
+playwright
+scipy
+scikit-learn
+python-dotenv
+huggingface-hub
