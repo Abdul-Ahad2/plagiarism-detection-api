@@ -33,7 +33,7 @@ POLITENESS_DELAY = 0.1  # Reduced from 0.25
 GOOGLE_NUM_DEFAULT = 10
 MIN_TEXT_LENGTH = 700
 GOOGLE_API_TIMEOUT = 6
-BRAVE_API_KEY = "BSAE_jMY2tpTa_jYwCkcaiddxmzLs7m"
+BRAVE_API_KEY = "i_dont_use_it_but_you_can_add_yours"
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 
 _api_key_index = 0
